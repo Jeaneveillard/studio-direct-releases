@@ -21,8 +21,14 @@
         border-radius: 12px; border: 1px solid #232a3a; object-fit: cover;
         transform: scaleX(-1); /* miroir : plus naturel pour se cadrer */
       }
+      /* L'hote n'est pas un miroir : on le voit tel qu'il est. Une fois son image
+         recue, elle prend la grande place et l'auto-cadrage passe en vignette. */
+      #host-view { transform: none; }
+      body.avec-hote #preview { width: min(40vw, 220px); }
       .status { color: #8b93a7; font-size: 14px; min-height: 20px; text-align: center; }
       .status.err { color: #ff7a7a; }
+      .media-status { color: #ffc46b; font-size: 14px; text-align: center; max-width: 520px; }
+      .tip { color: #6f7789; font-size: 13px; text-align: center; max-width: 520px; line-height: 1.5; }
       .row { display: flex; gap: 10px; flex-wrap: wrap; justify-content: center; }
       button {
         font: inherit; color: #e8ecf4; background: #171c28;
@@ -38,15 +44,28 @@
   </head>
   <body>
     <h1>Studio Direct <small>— rejoindre le direct</small></h1>
+    <!-- Image de l'hote (muette : son audio garde son propre element, chemin eprouve
+         y compris la reprise au toucher sur iOS). Muet => demarrage automatique
+         autorise partout, sans geste utilisateur. -->
+    <video id="host-view" class="hidden" autoplay playsinline muted></video>
+    <div id="host-label" class="tip hidden">Votre hôte</div>
     <video id="preview" autoplay playsinline muted></video>
+    <div id="self-label" class="tip">Vous</div>
     <div id="status" class="status">Vérification du lien…</div>
+    <div id="media-status" class="media-status"></div>
     <div class="row">
       <button id="join" class="primary hidden">Rejoindre avec caméra et micro</button>
+      <button id="restart-cam" class="primary hidden">Réactiver la caméra</button>
       <button id="mute-mic" class="hidden">Couper le micro</button>
       <button id="mute-cam" class="hidden">Couper la caméra</button>
       <button id="hangup" class="hidden">Raccrocher</button>
     </div>
-    <audio id="return-audio" autoplay></audio>
+    <div id="tip" class="tip hidden">
+      Sur iPhone et iPad : gardez cette page ouverte et l'écran allumé — changer
+      d'application coupe la caméra. Si l'image reste noire, ouvrez ce lien dans
+      Safari ou Chrome plutôt que dans le navigateur intégré d'une messagerie.
+    </div>
+    <audio id="return-audio" autoplay playsinline></audio>
 
     <script src="peerjs.min.js"></script>
     <script>
@@ -56,6 +75,12 @@
       const $ = (id) => document.getElementById(id);
       const statusEl = $('status');
       const setStatus = (t, err) => { statusEl.textContent = t; statusEl.classList.toggle('err', !!err); };
+      // Ligne dediee a la sante camera/micro : elle ne doit jamais etre ecrasee par
+      // les messages de connexion (c'est le silence sur cette ligne-la qui a rendu
+      // un ecran noir indiagnosticable).
+      const setMediaStatus = (t) => { $('media-status').textContent = t || ''; };
+
+      const VIDEO_CONSTRAINTS = { width: { ideal: 1280 }, height: { ideal: 720 } };
 
       const room = new URLSearchParams(location.search).get('room') || '';
       const ROOM_RE = /^[a-hj-km-np-z2-9]{8}$/; // meme alphabet que l'app
@@ -68,11 +93,41 @@
         $('join').classList.remove('hidden');
       }
 
+      // L'apercu ne demarre pas tout seul partout : sur iOS (iPhone/iPad), un <video>
+      // dont on affecte srcObject reste souvent fige tant qu'on n'appelle pas play(),
+      // et l'appel peut etre refuse s'il sort du geste utilisateur -> on propose alors
+      // de toucher l'image. Sans ca : apercu noir, sans un mot d'explication.
+      async function playPreview() {
+        const v = $('preview');
+        try {
+          await v.play();
+          return true;
+        } catch (_) {
+          setMediaStatus("Touchez l'image ci-dessus pour afficher votre caméra.");
+          return false;
+        }
+      }
+      $('preview').onclick = () => { $('preview').play().then(() => setMediaStatus(''), () => {}); };
+
+      // Surveille la piste video : sur iOS, passer dans une autre application ou
+      // verrouiller l'ecran arrete la capture. La piste devient 'muted' (gel) ou
+      // se termine ('ended') — dans les deux cas l'hote ne recoit plus d'image, et
+      // jusqu'ici personne n'en etait informe, ni l'invite ni l'hote.
+      function watchVideoTrack(t) {
+        if (!t) return;
+        t.addEventListener('mute', () => setMediaStatus('Votre caméra est en pause (application en arrière-plan ?). Revenez sur cette page.'));
+        t.addEventListener('unmute', () => setMediaStatus(''));
+        t.addEventListener('ended', () => {
+          setMediaStatus("Votre caméra s'est arrêtée. L'hôte ne vous voit plus.");
+          $('restart-cam').classList.remove('hidden');
+        });
+      }
+
       $('join').onclick = async () => {
         $('join').disabled = true;
         try {
           stream = await navigator.mediaDevices.getUserMedia({
-            video: { width: { ideal: 1280 }, height: { ideal: 720 } },
+            video: VIDEO_CONSTRAINTS,
             audio: { echoCancellation: true, noiseSuppression: true },
           });
         } catch (e) {
@@ -81,17 +136,145 @@
           return;
         }
         $('preview').srcObject = stream;
+        await playPreview();
+        watchVideoTrack(stream.getVideoTracks()[0]);
+        $('tip').classList.remove('hidden');
         connect();
       };
+
+      // Reprend une camera apres un arret (retour d'arriere-plan sur iPad, camera
+      // reprise par une autre application...) sans refaire toute la connexion :
+      // la nouvelle piste remplace l'ancienne dans l'envoi deja etabli.
+      $('restart-cam').onclick = async () => {
+        $('restart-cam').disabled = true;
+        try {
+          const fresh = await navigator.mediaDevices.getUserMedia({ video: VIDEO_CONSTRAINTS, audio: false });
+          const track = fresh.getVideoTracks()[0];
+          const pc = call && call.peerConnection;
+          const sender = pc && pc.getSenders().find((s) => s.track && s.track.kind === 'video');
+          if (sender) await sender.replaceTrack(track);
+          const old = stream && stream.getVideoTracks()[0];
+          if (old) { stream.removeTrack(old); try { old.stop(); } catch (_) {} }
+          if (stream) stream.addTrack(track);
+          $('preview').srcObject = stream;
+          await playPreview();
+          watchVideoTrack(track);
+          setMediaStatus('');
+          $('restart-cam').classList.add('hidden');
+          $('mute-cam').textContent = 'Couper la caméra';
+          $('mute-cam').classList.remove('off');
+        } catch (e) {
+          setMediaStatus('Impossible de réactiver la caméra : ' + e.message);
+        }
+        $('restart-cam').disabled = false;
+      };
+
+      // Retour au premier plan : l'apercu peut etre reste fige (iOS).
+      document.addEventListener('visibilitychange', () => {
+        if (document.visibilityState !== 'visible' || !stream) return;
+        const t = stream.getVideoTracks()[0];
+        if (t && t.readyState === 'ended') {
+          $('restart-cam').classList.remove('hidden');
+        } else if ($('preview').paused) {
+          playPreview();
+        }
+      });
+
+      // Delai au-dela duquel une mise en relation qui n'a rien donne est declaree
+      // en echec : c'est le cas frequent des reseaux mobiles (4G/5G), dont le NAT
+      // empeche souvent la liaison directe faute de serveur relais (TURN).
+      const DELAI_LIAISON_MS = 20000;
+      let liaisonTimer = null;
+      let liee = false;
+
+      function liaisonEtablie() {
+        if (liee) return;
+        liee = true;
+        clearTimeout(liaisonTimer);
+        setStatus('Connecté — vous êtes dans le direct.');
+      }
+
+      function liaisonEchouee() {
+        clearTimeout(liaisonTimer);
+        setStatus(
+          "Impossible d'établir la liaison avec votre hôte. C'est presque toujours le "
+          + 'réseau : essayez en Wi-Fi plutôt qu\'en données mobiles, ou depuis un autre réseau.',
+          true,
+        );
+      }
+
+      // Ce que CETTE page envoie reellement. Une camera qui s'affiche en aperçu ne
+      // prouve rien : l'aperçu vient du capteur, l'antenne vient de l'encodeur. Deux
+      // invitees mobiles de suite ont vu leur propre image pendant que l'hôte ne
+      // recevait rien — sans que personne, des deux cotes, puisse le constater.
+      function surveillerEnvoi(pc) {
+        if (!pc || !pc.getStats) return;
+        let precedent = null;
+        setInterval(async () => {
+          let v = null;
+          try {
+            (await pc.getStats()).forEach((r) => {
+              if (r.type === 'outbound-rtp' && r.kind === 'video') {
+                v = { images: r.framesEncoded || 0, w: r.frameWidth || 0, h: r.frameHeight || 0, cause: r.qualityLimitationReason };
+              }
+            });
+          } catch (_) { return; }
+          if (!v) { setMediaStatus("Votre appareil n'envoie aucune vidéo à votre hôte."); return; }
+          if (precedent && v.images > precedent.images) {
+            setMediaStatus(v.w ? 'Votre image part bien (' + v.w + '×' + v.h + ').' : 'Votre image part bien.');
+          } else if (precedent) {
+            setMediaStatus(
+              "Votre appareil n'arrive pas à envoyer votre image"
+              + (v.cause && v.cause !== 'none' ? ' (' + v.cause + ')' : '')
+              + ' — dites-le à votre hôte.',
+            );
+          }
+          precedent = v;
+        }, 3000);
+      }
 
       function connect() {
         setStatus("Connexion à l'hôte…");
         peer = new Peer('studio-direct-' + room + '-guest');
         peer.on('open', () => {
           call = peer.call('studio-direct-' + room + '-host', stream);
-          // Retour audio de l'hote (son micro) si l'hote en envoie un.
-          call.on('stream', (remote) => { $('return-audio').srcObject = remote; });
-          setStatus('Connecté — vous êtes dans le direct.');
+          // Retour audio de l'hote (son micro) si l'hote en envoie un. play() explicite :
+          // meme raison que l'apercu, l'attribut autoplay ne suffit pas sur iOS.
+          call.on('stream', (remote) => {
+            $('return-audio').srcObject = remote;
+            liaisonEtablie();
+            // Image de l'hote, si elle arrive (l'appel peut n'apporter que du son).
+            if (remote.getVideoTracks().length) {
+              const hv = $('host-view');
+              hv.srcObject = remote;
+              hv.classList.remove('hidden');
+              $('host-label').classList.remove('hidden');
+              document.body.classList.add('avec-hote');
+              hv.play().catch(() => {});
+            }
+            $('return-audio').play().catch(() => {
+              setMediaStatus("Touchez l'écran pour entendre votre hôte.");
+              document.body.addEventListener('click', () => {
+                $('return-audio').play().then(() => setMediaStatus(''), () => {});
+              }, { once: true });
+            });
+          });
+          // 'open' ne dit QUE ceci : le service de mise en relation a repondu. La
+          // liaison directe avec l'hote, elle, n'est pas encore faite — annoncer
+          // « Connecté » ici laissait un invité persuadé d'etre dans le direct alors
+          // que rien ne passait, sans un mot d'explication (constate deux fois, sur
+          // mobile). Le vrai etat vient du media recu ou de l'etat ICE.
+          setStatus("Mise en relation avec l'hôte…");
+          const pc = call.peerConnection;
+          if (pc) {
+            pc.addEventListener('iceconnectionstatechange', () => {
+              const st = pc.iceConnectionState;
+              if (st === 'connected' || st === 'completed') liaisonEtablie();
+              else if (st === 'failed') liaisonEchouee();
+            });
+          }
+          liaisonTimer = setTimeout(() => { if (!liee) liaisonEchouee(); }, DELAI_LIAISON_MS);
+          surveillerEnvoi(pc);
           $('join').classList.add('hidden');
           $('mute-mic').classList.remove('hidden');
           $('mute-cam').classList.remove('hidden');
@@ -123,6 +306,8 @@
       $('mute-cam').onclick = () => toggleTrack('Video', $('mute-cam'), 'Couper la caméra', 'Caméra coupée');
 
       function teardown(stopMedia) {
+        clearTimeout(liaisonTimer);
+        liee = false;
         if (call) { try { call.close(); } catch (_) {} call = null; }
         if (peer) { try { peer.destroy(); } catch (_) {} peer = null; }
         if (stopMedia && stream) {
@@ -135,9 +320,16 @@
       $('hangup').onclick = () => {
         teardown(true);
         setStatus('Vous avez quitté le direct. Vous pouvez fermer cette page.');
+        setMediaStatus('');
         $('mute-mic').classList.add('hidden');
         $('mute-cam').classList.add('hidden');
+        $('restart-cam').classList.add('hidden');
         $('hangup').classList.add('hidden');
+        $('tip').classList.add('hidden');
+        $('host-view').srcObject = null;
+        $('host-view').classList.add('hidden');
+        $('host-label').classList.add('hidden');
+        document.body.classList.remove('avec-hote');
       };
     </script>
   </body>
