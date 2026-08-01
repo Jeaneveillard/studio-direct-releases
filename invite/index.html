@@ -233,6 +233,19 @@
         }, 3000);
       }
 
+      // Donne a un element exactement les pistes qui le concernent. Ne fait rien si
+      // elles y sont deja : une reaffectation de srcObject relance le chargement et
+      // annule la lecture en cours, meme quand rien n'a change.
+      function attacherPistes(el, pistes, surLecture) {
+        if (!pistes.length) return;
+        const actuelles = el.srcObject && el.srcObject.getTracks ? el.srcObject.getTracks() : [];
+        const inchange = actuelles.length === pistes.length && pistes.every((t, i) => actuelles[i] === t);
+        if (inchange) return;
+        el.srcObject = new MediaStream(pistes);
+        const p = el.play();
+        if (p && surLecture) surLecture(p);
+      }
+
       function connect() {
         setStatus("Connexion à l'hôte…");
         peer = new Peer('studio-direct-' + room + '-guest');
@@ -241,23 +254,24 @@
           // Retour audio de l'hote (son micro) si l'hote en envoie un. play() explicite :
           // meme raison que l'apercu, l'attribut autoplay ne suffit pas sur iOS.
           call.on('stream', (remote) => {
-            $('return-audio').srcObject = remote;
             liaisonEtablie();
-            // Image de l'hote, si elle arrive (l'appel peut n'apporter que du son).
-            if (remote.getVideoTracks().length) {
-              const hv = $('host-view');
-              hv.srcObject = remote;
-              hv.classList.remove('hidden');
-              $('host-label').classList.remove('hidden');
-              document.body.classList.add('avec-hote');
-              hv.play().catch(() => {});
-            }
-            $('return-audio').play().catch(() => {
+            // PeerJS emet 'stream' UNE FOIS PAR PISTE (le son, puis l'image). Chaque
+            // element recoit donc ses propres pistes, et n'est jamais reaffecte pour
+            // rien : reaffecter srcObject interrompt le play() en vol (AbortError) —
+            // c'est ainsi que l'arrivee de l'image avait fait taire le son de l'hote.
+            attacherPistes($('return-audio'), remote.getAudioTracks(), (p) => p.catch(() => {
               setMediaStatus("Touchez l'écran pour entendre votre hôte.");
               document.body.addEventListener('click', () => {
                 $('return-audio').play().then(() => setMediaStatus(''), () => {});
               }, { once: true });
-            });
+            }));
+            const video = remote.getVideoTracks();
+            if (video.length) {
+              attacherPistes($('host-view'), video, (p) => p.catch(() => {}));
+              $('host-view').classList.remove('hidden');
+              $('host-label').classList.remove('hidden');
+              document.body.classList.add('avec-hote');
+            }
           });
           // 'open' ne dit QUE ceci : le service de mise en relation a repondu. La
           // liaison directe avec l'hote, elle, n'est pas encore faite — annoncer
